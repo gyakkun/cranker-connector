@@ -1,5 +1,8 @@
 package com.hsbc.cranker.connector;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -10,11 +13,14 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
+import java.util.function.Function;
 
 /**
  * A single connection between a connector and a router
  */
 public interface ConnectorSocket {
+    Logger LOGGER = LoggerFactory.getLogger(CrankerConnectorImpl.class);
+
     /**
      * The state of the connection from this connector to a router
      */
@@ -80,7 +86,6 @@ public interface ConnectorSocket {
 }
 
 class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
-
     private volatile ScheduledFuture<?> timeoutTask;
     private volatile Flow.Subscriber<? super ByteBuffer> targetBodySubscriber;
 
@@ -115,6 +120,7 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
     }
 
     private void newRequestToTarget(CrankerRequestParser protocolRequest, WebSocket webSocket) {
+        LOGGER.info("Sending request to target");
         CrankerResponseBuilder protocolResponse = CrankerResponseBuilder.newBuilder();
 
         URI dest = targetURI.resolve(protocolRequest.dest);
@@ -130,8 +136,11 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
         HttpRequest.Builder rb = HttpRequest.newBuilder()
             .uri(dest)
             .method(protocolRequest.httpMethod, bodyPublisher);
-        putHeadersTo(rb, protocolRequest);
-
+        try {
+            putHeadersTo(rb, protocolRequest);
+        } catch (Throwable th) {
+            LOGGER.error("Ex when putting headers: ", th);
+        }
         this.requestToTarget = proxyEventListener.beforeProxyToTarget(rb.build(), rb);
 
         HttpResponse.BodyHandler<Void> bh = new TargetResponseHandler(protocolResponse, webSocket);
@@ -163,6 +172,7 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
 
     @Override
     public void onOpen(WebSocket webSocket) {
+        LOGGER.info("Websocket opened!");
         this.webSocket = webSocket;
         onSignOfLife();
         updateState(State.IDLE);
@@ -191,6 +201,8 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
 
     @Override
     public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+        LOGGER.info("Text coming!");
+        LOGGER.info("Text content: {}", data);
 
         if (state.isCompleted()) {
             // consume the data on the fly, so that CLOSE frame can arrive and websocket can close gracefully
@@ -232,6 +244,7 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
 
     @Override
     public CompletionStage<?> onBinary(WebSocket webSocket, ByteBuffer data, boolean last) {
+        LOGGER.info("Binary coming!");
 
         if (state.isCompleted()) {
             // consume the data on the fly, so that CLOSE frame can arrive and websocket can close gracefully
@@ -266,6 +279,7 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
 
     @Override
     public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+        LOGGER.info("Websocket closed: code={}, reason={}", statusCode, reason);
         close(State.ROUTER_CLOSED, WebSocket.NORMAL_CLOSURE, null);
         return null;
     }
@@ -340,6 +354,7 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
 
         @Override
         public HttpResponse.BodySubscriber<Void> apply(HttpResponse.ResponseInfo responseInfo) {
+            LOGGER.info("Target responding: {}", responseInfo.toString());
 
             protocolResponse
                 .withResponseStatus(responseInfo.statusCode())
@@ -352,7 +367,16 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
             }
 
             String respHeaders = protocolResponse.build();
-            CompletableFuture<WebSocket> headersSentFuture = webSocket.sendText(respHeaders, true)
+            CompletableFuture<WebSocket> headersSentFuture = webSocket
+                .sendText(respHeaders, true)
+                .exceptionally(th -> {
+                    LOGGER.error("[to-router] Ex when sending text: ", th);
+                    return webSocket;
+                })
+                .thenApply(ws-> {
+                    LOGGER.info("[to-router] Text sent!");
+                    return ws;
+                })
                 .whenComplete((webSocket1, throwable) -> {
                     if (throwable != null) {
                         proxyEventListener.onProxyError(requestToTarget, throwable);
@@ -380,7 +404,7 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
 
                 @Override
                 public void onNext(List<ByteBuffer> items) {
-
+                    LOGGER.info("Target comes with bytes: {}", items);
                     if (items.isEmpty()) {
                         subscription.request(1);
                         return;

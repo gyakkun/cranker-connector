@@ -2,6 +2,7 @@ package com.hsbc.cranker.connector;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.helpers.NOPLogger;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -10,16 +11,20 @@ import java.net.http.HttpResponse;
 import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
+
+import static org.slf4j.helpers.NOPLogger.NOP_LOGGER;
 
 /**
  * A single connection between a connector and a router
  */
 public interface ConnectorSocket {
-    Logger LOGGER = LoggerFactory.getLogger(CrankerConnectorImpl.class);
+    Logger LOGGER = NOP_LOGGER;
 
     /**
      * The state of the connection from this connector to a router
@@ -103,7 +108,8 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
     private volatile State state = State.NOT_STARTED;
     private final CompletableFuture<Void> complete = new CompletableFuture<>();
     private StringBuilder onTextBuffer;
-
+    private AtomicBoolean isWssReq = new AtomicBoolean(false);
+    private volatile WebSocket tgtWss = null;
 
     ConnectorSocketImpl(URI targetURI, HttpClient httpClient, ConnectorSocketListener listener,
                         ProxyEventListener proxyEventListener, ScheduledExecutorService executor) {
@@ -121,6 +127,15 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
 
     private void newRequestToTarget(CrankerRequestParser protocolRequest, WebSocket webSocket) {
         LOGGER.info("Sending request to target");
+        if (isWebsocketRequest(protocolRequest)) {
+            if (!isWssReq.compareAndSet(false, true)) {
+                // TODO: uncommon situation
+                LOGGER.error("Already wss");
+                return;
+            }
+            forwardWebsocketRequest(protocolRequest, webSocket);
+            return;
+        }
         CrankerResponseBuilder protocolResponse = CrankerResponseBuilder.newBuilder();
 
         URI dest = targetURI.resolve(protocolRequest.dest);
@@ -154,6 +169,35 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
                 webSocket.request(1);
             }
         });
+    }
+
+    private void forwardWebsocketRequest(CrankerRequestParser protocolRequest, WebSocket connWss) {
+        WebSocket.Builder tgtWssBuilder = httpClient.newWebSocketBuilder();
+        putHeadersTo(tgtWssBuilder,protocolRequest);
+        this.tgtWss = tgtWssBuilder.buildAsync(URI.create(protocolRequest.dest), new ForwardWssListener(connWss))
+            .join();
+    }
+
+    private boolean isWebsocketRequest(CrankerRequestParser protocolRequest) {
+        return Arrays.stream(protocolRequest.headers)
+            .anyMatch(i -> i.toLowerCase().startsWith("upgrade") && i.contains("websocket"));
+    }
+
+    private void putHeadersTo(WebSocket.Builder requestToTarget, CrankerRequestParser crankerRequestParser) {
+        for (String line : crankerRequestParser.headers) {
+            int pos = line.indexOf(':');
+            // this will ignore HTTP/2 pseudo request headers like :method, :path, :authority
+            if (pos > 0) {
+                String header = line.substring(0, pos).trim().toLowerCase();
+                String value = line.substring(pos + 1);
+                if (!HttpUtils.DISALLOWED_REQUEST_HEADERS.contains(header)
+                    && !header.startsWith("sec-websocket")
+                    && !header.startsWith("upgrade")
+                ) {
+                    requestToTarget.header(header, value);
+                }
+            }
+        }
     }
 
     private void putHeadersTo(HttpRequest.Builder requestToTarget, CrankerRequestParser crankerRequestParser) {
@@ -201,8 +245,10 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
 
     @Override
     public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
-        LOGGER.info("Text coming!");
-        LOGGER.info("Text content: {}", data);
+        if (isWssReq.get()) {
+            tgtWss.sendText(data, last);
+            return null;
+        }
 
         if (state.isCompleted()) {
             // consume the data on the fly, so that CLOSE frame can arrive and websocket can close gracefully
@@ -245,6 +291,10 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
     @Override
     public CompletionStage<?> onBinary(WebSocket webSocket, ByteBuffer data, boolean last) {
         LOGGER.info("Binary coming!");
+        if (isWssReq.get()) {
+            tgtWss.sendBinary(data, last);
+            return null;
+        }
 
         if (state.isCompleted()) {
             // consume the data on the fly, so that CLOSE frame can arrive and websocket can close gracefully
@@ -290,6 +340,8 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
     }
 
     public void close(State newState, int statusCode, Throwable error) {
+        String closingMsg = String.format("prev=%s, new=%s, code=%d", state.toString(), newState.toString(), statusCode);
+        LOGGER.info("Going to close: prev state={}, new state={}, code={}",  state, newState, statusCode);
         updateState(newState);
         cancelTimeout();
         if (pingPongTask != null) {
@@ -297,7 +349,7 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
             pingPongTask = null;
         }
         if (webSocket != null && !webSocket.isOutputClosed()) {
-            webSocket.sendClose(statusCode, error != null ? error.getMessage() : "");
+            webSocket.sendClose(statusCode, error != null ? error.getMessage() : closingMsg);
         }
         if (responseFuture != null && !responseFuture.isDone() && !responseFuture.isCancelled()
             && statusCode != WebSocket.NORMAL_CLOSURE) {
@@ -354,7 +406,7 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
 
         @Override
         public HttpResponse.BodySubscriber<Void> apply(HttpResponse.ResponseInfo responseInfo) {
-            LOGGER.info("Target responding: {}", responseInfo.toString());
+            LOGGER.info("Target responding: {}, {}", responseInfo.statusCode(), responseInfo.headers());
 
             protocolResponse
                 .withResponseStatus(responseInfo.statusCode())
@@ -374,7 +426,7 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
                     return webSocket;
                 })
                 .thenApply(ws-> {
-                    LOGGER.info("[to-router] Text sent!");
+                    LOGGER.info("[to-router] Text sent: {}", respHeaders);
                     return ws;
                 })
                 .whenComplete((webSocket1, throwable) -> {
@@ -491,5 +543,45 @@ class ConnectorSocketImpl implements WebSocket.Listener, ConnectorSocket {
                 }
             });
         }
+    }
+}
+
+
+class ForwardWssListener implements WebSocket.Listener {
+    final WebSocket connWss;
+
+    ForwardWssListener(WebSocket connWss) {
+        this.connWss = connWss;
+    }
+
+    @Override
+    public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+        connWss.sendText(data, last);
+        return WebSocket.Listener.super.onText(webSocket, data, last);
+    }
+
+    @Override
+    public CompletionStage<?> onBinary(WebSocket webSocket, ByteBuffer data, boolean last) {
+        connWss.sendBinary(data,last);
+        return WebSocket.Listener.super.onBinary(webSocket, data, last);
+    }
+
+//            @Override
+//            public CompletionStage<?> onPing(WebSocket webSocket, ByteBuffer message) {
+//                connWss.sendPing(message);
+//                return WebSocket.Listener.super.onPing(webSocket, message);
+//            }
+//
+//            @Override
+//            public CompletionStage<?> onPong(WebSocket webSocket, ByteBuffer message) {
+//                connWss.sendPong(message);
+//                return WebSocket.Listener.super.onPong(webSocket, message);
+//            }
+
+    @Override
+    public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+        connWss.request(1);
+        connWss.sendClose(statusCode, reason);
+        return WebSocket.Listener.super.onClose(webSocket, statusCode, reason);
     }
 }

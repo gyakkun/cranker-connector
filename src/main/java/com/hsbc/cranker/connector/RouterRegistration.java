@@ -216,7 +216,8 @@ class RouterRegistrationImpl implements ConnectorSocketListener, RouterRegistrat
      * @return Milliseconds to wait until trying again, increasing exponentially, capped at 10 seconds
      */
     private int retryAfterMillis() {
-        return 500 + Math.min(10000, (int) Math.pow(2, connectAttempts.get()));
+        return 50;
+        // return 500 + Math.min(10000, (int) Math.pow(2, connectAttempts.get()));
     }
 
     @Override

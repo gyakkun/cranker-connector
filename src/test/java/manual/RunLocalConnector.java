@@ -3,8 +3,8 @@ package manual;
 import com.hsbc.cranker.connector.*;
 import io.muserver.BaseWebSocket;
 import io.muserver.DoneCallback;
+import io.muserver.Method;
 import io.muserver.MuServer;
-import io.muserver.WebSocketHandlerBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -14,7 +14,11 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static com.hsbc.cranker.connector.CrankerConnectorBuilder.CRANKER_PROTOCOL_1;
+import static io.muserver.ContextHandlerBuilder.context;
 import static io.muserver.MuServerBuilder.muServer;
+import static io.muserver.Routes.route;
+import static io.muserver.WebSocketHandlerBuilder.webSocketHandler;
+import static org.slf4j.helpers.NOPLogger.NOP_LOGGER;
 
 public class RunLocalConnector {
 
@@ -26,36 +30,38 @@ public class RunLocalConnector {
 
     public static void main(String[] args) {
         final MuServer server = muServer()
+            .withInterface("127.0.0.1")
             .withHttpPort(14444)
-            .addHandler((req, res) -> {
-                log.info("method uri: {} {}", req.method(), req.uri());
-                log.info("headers: {}", req.headers());
-                return false;
-            })
-            .addHandler(WebSocketHandlerBuilder.webSocketHandler()
-                .withPath("/example/echo-socket")
-                .withWebSocketFactory((request, responseHeaders) -> {
-                    log.info("creating ws");
-                    return new BaseWebSocket() {
-                        @Override
-                        public void onText(String message, boolean isLast, DoneCallback onComplete) {
-                            session().sendText("Received " + message, onComplete);
-                        };
-                    };
-                })
+            .addHandler(
+                context("example")
+                    .addHandler((req, res) -> {
+                        // log.info("req: {} {}", req.method(), req.uri());
+                        return false;
+                    })
+                    .addHandler(route(Method.GET, "hello", (req, res, pathParams) -> {
+                        res.write("Hi there!");
+                    }))
+                    .addHandler(webSocketHandler()
+                        .withWebSocketFactory((request, responseHeaders) -> new BaseWebSocket() {
+                            @Override
+                            public void onText(String message, boolean isLast, DoneCallback onComplete) {
+                                session().sendText("[ECHO BACK] " + message, onComplete);
+                            }
+                        })
+                    )
             )
             .start();
 
         final CrankerConnector connector = CrankerConnectorBuilder.connector()
             .withPreferredProtocols(List.of(CRANKER_PROTOCOL_1))
             .withDomain("127.0.0.1")
-            .withRouterUris(() -> List.of(URI.create("ws://localhost:3000")))
+            .withRouterUris(() -> List.of(URI.create("ws://127.0.0.1:3000")))
             .withHttpClient(CrankerConnectorBuilder.createHttpClient(true).build())
-            .withComponentName("local-test")
+            .withComponentName("example")
             .withRoute("example")
-            .withPreferredProtocols(List.of("cranker_3.0"))
+            .withPreferredProtocols(List.of("cranker_1.0"))
             // .withSlidingWindowSize(1)
-            .withTarget(URI.create("http://localhost:14444"))
+            .withTarget(URI.create("http://127.0.0.1:14444"))
             .withRouterRegistrationListener(new RouterEventListener() {
                 public void onRegistrationChanged(ChangeData data) {
                     log.info("Router registration changed: " + data);

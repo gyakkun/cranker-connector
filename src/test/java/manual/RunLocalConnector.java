@@ -10,7 +10,9 @@ import org.slf4j.LoggerFactory;
 
 import java.net.URI;
 import java.net.http.HttpRequest;
+import java.time.Duration;
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
 import static com.hsbc.cranker.connector.CrankerConnectorBuilder.CRANKER_PROTOCOL_1;
@@ -22,7 +24,8 @@ import static org.slf4j.helpers.NOPLogger.NOP_LOGGER;
 
 public class RunLocalConnector {
 
-    private static final Logger log = LoggerFactory.getLogger(RunLocalConnector.class);
+    // private static final Logger log = LoggerFactory.getLogger(RunLocalConnector.class);
+    private static final Logger log = NOP_LOGGER;
 
     static {
         System.setProperty("jdk.internal.httpclient.disableHostnameVerification", "true");
@@ -40,6 +43,18 @@ public class RunLocalConnector {
                     })
                     .addHandler(route(Method.GET, "hello", (req, res, pathParams) -> {
                         res.write("Hi there!");
+                    }))
+                    .addHandler(route(Method.GET, "busy", (req, res, pathParams) -> {
+                        try {
+                            log.error("sleeping");
+                            TimeUnit.SECONDS.sleep(1 + new Random().nextInt(5));
+                            log.error("wake");
+                        } catch (InterruptedException ignore) {
+                        }
+                        res.write("Hi, I'm late! Sorry for letting you wait " + (System.currentTimeMillis() - req.startTime()) + "ms.");
+                    }))
+                    .addHandler(route(Method.POST, "post", (req,res,pathParams)->{
+
                     }))
                     .addHandler(webSocketHandler()
                         .withWebSocketFactory((request, responseHeaders) -> new BaseWebSocket() {
